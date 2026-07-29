@@ -208,9 +208,37 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
             generate_title("x" * 1000, "y" * 1000)
 
-        # The user content in the messages should be truncated
-        user_content = captured_kwargs["messages"][1]["content"]
-        assert len(user_content) < 1100  # 500 + 500 + formatting
+        messages = captured_kwargs["messages"]
+        user_msg_content = messages[1]["content"]
+        assert len(user_msg_content) < 1100
+        assert "x" * 500 in user_msg_content
+        assert "x" * 501 not in user_msg_content
+
+    def test_truncates_image_list_messages(self):
+        """Image content block lists should have text extracted and be truncated cleanly."""
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Image Title"
+            return resp
+
+        huge_base64 = "A" * 50000
+        user_list = [
+            {"type": "text", "text": "describe image " + "z" * 600},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge_base64}"}},
+        ]
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title(user_list, "assistant reply")
+
+        messages = captured_kwargs["messages"]
+        user_msg_content = messages[1]["content"]
+        assert huge_base64 not in user_msg_content
+        assert "describe image" in user_msg_content
+        assert len(user_msg_content) < 1100
 
     def test_skips_when_title_generation_disabled(self):
         """auxiliary.title_generation.enabled=false disables automatic titles."""
