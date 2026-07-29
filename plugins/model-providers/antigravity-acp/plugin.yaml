@@ -1,0 +1,5 @@
+name: antigravity-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Antigravity ACP via native stdio subprocess
+author: Antigravity

@@ -374,6 +374,16 @@ export function ModelPicker({
           setProviderIdx(fullProviderIdx)
         }
 
+        if (provider.slug === 'copilot-acp' || provider.models?.length === 1) {
+          const defaultModel =
+            provider.slug === 'copilot-acp' ? 'copilot-acp' :
+            (provider.models?.[0] ?? provider.slug)
+          onSelect(
+            `${defaultModel} --provider ${provider.slug}${allowPersistGlobal && persistGlobal ? ' --global' : ` ${TUI_SESSION_MODEL_FLAG}`}`
+          )
+          return
+        }
+
         setStage('model')
         setModelIdx(0)
         setFilter('')
