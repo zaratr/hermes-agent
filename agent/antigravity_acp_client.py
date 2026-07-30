@@ -13,18 +13,21 @@ import os
 import queue
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterator
 
 from agent.copilot_acp_client import (
     CopilotACPClient,
     _resolve_home_dir,
     _extract_tool_calls_from_text,
     _completion_to_stream_chunks,
+    _format_messages_as_prompt,
 )
 from tools.environments.local import hermes_subprocess_env
 
@@ -32,6 +35,7 @@ ACP_MARKER_BASE_URL = "acp://antigravity"
 
 DEFAULT_AGY_ACP_BIN = r"C:\Users\zarat\.gemini\antigravity\agy-acp\dist\agy-acp-windows-x64.exe"
 DEFAULT_AGY_BIN = r"C:\Users\zarat\AppData\Local\agy\bin\agy.exe"
+DIRECT_PROMPT_LIMIT = 24_000
 
 
 def _resolve_command() -> str:
@@ -61,27 +65,36 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _build_prompt_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build ACP-native prompt blocks from the last user message.
+def _build_prompt_blocks(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+) -> list[dict[str, Any]]:
+    """Build ACP-native prompt blocks for the current Hermes turn.
 
-    agy manages its own conversation state (SQLite) across turns, so we must
-    only send the *current* user turn — not the full conversation history that
-    Hermes reconstructs. Sending the entire transcript as a single blob causes
-    the model to see it as a long task instruction and respond with a generic
-    greeting instead of answering the actual question.
+    Each request creates a fresh ACP session, so a tool follow-up must include
+    the latest user message plus any assistant tool request and Hermes tool
+    result that followed it. Earlier turns remain excluded: sending the full
+    reconstructed transcript as one task confused agy and also wastes context.
 
     For vision: image_url content blocks are converted to ACP ``resource``
     blocks so they reach the model instead of being silently dropped.
     """
-    # Walk backwards to find the last user message
+    # Walk backwards to find the current turn's user-message boundary.
     last_user: dict[str, Any] | None = None
-    for msg in reversed(messages or []):
+    last_user_index: int | None = None
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
         if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
             last_user = msg
+            last_user_index = index
             break
 
     if last_user is None:
         return [{"type": "text", "text": ""}]
+    assert last_user_index is not None
 
     content = last_user.get("content")
     blocks: list[dict[str, Any]] = []
@@ -145,6 +158,44 @@ def _build_prompt_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     else:
         blocks.append({"type": "text", "text": str(content or "")})
 
+    if model or tools or tool_choice is not None:
+        current_turn: list[dict[str, Any]] = []
+        for message in messages[last_user_index:]:
+            if not isinstance(message, dict):
+                continue
+            rendered_message = dict(message)
+            role = str(message.get("role") or "").lower()
+            content_text = str(message.get("content") or "").strip()
+            if role == "assistant" and message.get("tool_calls"):
+                tool_call_text = json.dumps(
+                    message.get("tool_calls"), ensure_ascii=False, default=str
+                )
+                rendered_message["content"] = "\n\n".join(
+                    part
+                    for part in (
+                        content_text,
+                        f"Hermes tool request:\n{tool_call_text}",
+                    )
+                    if part
+                )
+            elif role == "tool":
+                tool_name = str(message.get("name") or "unknown")
+                call_id = str(message.get("tool_call_id") or "unknown")
+                rendered_message["content"] = (
+                    f"Hermes tool result (name={tool_name}, call_id={call_id}):\n"
+                    f"{content_text}"
+                )
+            current_turn.append(rendered_message)
+
+        prompt_text = _format_messages_as_prompt(
+            current_turn,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        blocks = [block for block in blocks if block.get("type") != "text"]
+        blocks.insert(0, {"type": "text", "text": prompt_text})
+
     return blocks or [{"type": "text", "text": ""}]
 
 
@@ -154,6 +205,86 @@ def _guess_mime(suffix: str) -> str:
         ".png": "image/png", ".gif": "image/gif",
         ".webp": "image/webp", ".bmp": "image/bmp",
     }.get(suffix, "application/octet-stream")
+
+
+@contextmanager
+def _materialize_prompt_blocks(
+    prompt_blocks: list[dict[str, Any]],
+    *,
+    workdir: str | Path,
+) -> Iterator[list[dict[str, Any]]]:
+    """Keep oversized prompts and binary images off agy's command line."""
+    text = "\n\n".join(
+        str(block.get("text") or "")
+        for block in prompt_blocks
+        if block.get("type") == "text"
+    )
+    image_payloads: list[tuple[bytes, str]] = []
+    passthrough_blocks: list[dict[str, Any]] = []
+    for block in prompt_blocks:
+        if block.get("type") == "text":
+            continue
+        resource = block.get("resource")
+        if block.get("type") == "resource" and isinstance(resource, dict):
+            blob = resource.get("blob")
+            if isinstance(blob, str) and blob:
+                try:
+                    raw = base64.b64decode(blob, validate=True)
+                except Exception:
+                    passthrough_blocks.append(block)
+                    continue
+                mime = str(resource.get("mimeType") or "image/png").lower()
+                suffix = {
+                    "image/jpeg": ".jpg",
+                    "image/jpg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                    "image/gif": ".gif",
+                    "image/bmp": ".bmp",
+                }.get(mime, ".bin")
+                image_payloads.append((raw, suffix))
+                continue
+        passthrough_blocks.append(block)
+
+    if len(text) <= DIRECT_PROMPT_LIMIT and not image_payloads:
+        yield prompt_blocks
+        return
+
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix=".hermes-antigravity-", dir=str(workdir))
+    )
+    try:
+        image_paths: list[Path] = []
+        for index, (raw, suffix) in enumerate(image_payloads, start=1):
+            image_path = temp_dir / f"image-{index}{suffix}"
+            image_path.write_bytes(raw)
+            image_paths.append(image_path)
+
+        if image_paths:
+            text += (
+                "\n\nAttached image files:\n"
+                + "\n".join(f"- {path}" for path in image_paths)
+                + "\nUse your native multimodal vision to inspect these image files."
+            )
+
+        if len(text) > DIRECT_PROMPT_LIMIT:
+            prompt_file = temp_dir / "prompt.txt"
+            prompt_file.write_text(text, encoding="utf-8")
+            wire_text = (
+                    "Use your built-in file-reading capability to read the complete "
+                    f"UTF-8 Hermes request at {prompt_file}. Treat its entire contents "
+                    "as the active request and follow it exactly. Do not emit a Hermes "
+                    "tool call merely to read this internal prompt file."
+            )
+        else:
+            wire_text = text
+
+        wire_blocks = [{"type": "text", "text": wire_text}, *passthrough_blocks]
+        yield wire_blocks
+    finally:
+        import shutil
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class AntigravityACPClient(CopilotACPClient):
@@ -204,7 +335,12 @@ class AntigravityACPClient(CopilotACPClient):
     ) -> Any:
         from agent.copilot_acp_client import _DEFAULT_TIMEOUT_SECONDS
 
-        prompt_blocks = _build_prompt_blocks(messages or [])
+        prompt_blocks = _build_prompt_blocks(
+            messages or [],
+            model=model or self._model_id,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
         if timeout is None:
             _effective_timeout = _DEFAULT_TIMEOUT_SECONDS
@@ -287,6 +423,7 @@ class AntigravityACPClient(CopilotACPClient):
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
             raise RuntimeError("Antigravity ACP process did not expose stdin/stdout pipes.")
+        stdin = proc.stdin
 
         self.is_closed = False
         with self._active_process_lock:
@@ -333,8 +470,8 @@ class AntigravityACPClient(CopilotACPClient):
                 "method": method,
                 "params": params,
             }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
+            stdin.write(json.dumps(payload) + "\n")
+            stdin.flush()
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
@@ -428,15 +565,19 @@ class AntigravityACPClient(CopilotACPClient):
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                },
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-            )
+            workdir = Path(self._acp_cwd or os.getcwd())
+            with _materialize_prompt_blocks(
+                prompt_blocks, workdir=workdir
+            ) as wire_prompt_blocks:
+                _request(
+                    "session/prompt",
+                    {
+                        "sessionId": session_id,
+                        "prompt": wire_prompt_blocks,
+                    },
+                    text_parts=text_parts,
+                    reasoning_parts=reasoning_parts,
+                )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()
