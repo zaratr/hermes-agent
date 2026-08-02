@@ -131,6 +131,15 @@ def generate_title(
             logger.debug("Title runtime validator raised; proceeding", exc_info=True)
 
     # Truncate long messages to keep the request small
+    if isinstance(user_message, list):
+        _text_parts = [
+            str(part.get("text", ""))
+            for part in user_message
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        _user_text_str = " ".join(_text_parts).strip() or "[Image]"
+    else:
+        _user_text_str = str(user_message or "")
     user_snippet = _summarize_user_message(user_message)[:500]
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 

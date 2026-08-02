@@ -232,6 +232,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "antigravity-acp": ProviderConfig(
+        id="antigravity-acp",
+        name="Antigravity ACP",
+        auth_type="external_process",
+        inference_base_url="acp://antigravity",
+        base_url_env_var="ANTIGRAVITY_ACP_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -1770,6 +1777,9 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             if has_usable_secret(os.getenv(env_var, "")):
                 return True
 
+    if pconfig and pconfig.auth_type == "external_process":
+        return True
+
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
     # the user initiated inside Hermes (manual add / device-code / PKCE), plus
     # env-backed pool entries. This intentionally excludes ambient borrowed
@@ -1925,6 +1935,7 @@ def resolve_provider(
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
+        "antigravity-acp-agent": "antigravity-acp", "agy-acp": "antigravity-acp",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
@@ -6844,13 +6855,21 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "antigravity-acp":
+        command = (
+            os.getenv("HERMES_ANTIGRAVITY_ACP_COMMAND", "").strip()
+            or r"C:\Users\zarat\.gemini\antigravity\agy-acp\dist\agy-acp-windows-x64.exe"
+        )
+        raw_args = os.getenv("HERMES_ANTIGRAVITY_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--stdio"]
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -6885,7 +6904,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "antigravity-acp"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7067,6 +7086,18 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
+
+    if provider_id == "antigravity-acp":
+        command = os.getenv("AGY_BIN", r"C:\Users\zarat\.gemini\antigravity\agy-acp\dist\agy-acp-windows-x64.exe")
+        resolved_command = shutil.which(command) or command
+        return {
+            "provider": provider_id,
+            "api_key": "antigravity-acp",
+            "base_url": base_url.rstrip("/") or "acp://antigravity",
+            "command": resolved_command,
+            "args": ["--stdio"],
+            "source": "process",
+        }
 
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
