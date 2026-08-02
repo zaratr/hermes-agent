@@ -2286,6 +2286,8 @@ def list_authenticated_providers(
                 has_creds = has_vertex_credentials()
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
+        elif overlay.auth_type == "external_process":
+            has_creds = True
         elif overlay.extra_env_vars:
             has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
@@ -3074,8 +3076,18 @@ def list_authenticated_providers(
                 continue
             _models = _row.get("models") or []
             if current_model not in _models:
-                _row["models"] = [current_model, *_models]
-                _row["total_models"] = _row.get("total_models", len(_models)) + 1
+                from hermes_cli.models import _PROVIDER_MODELS
+
+                _row_slug = str(_row.get("slug") or "").strip().lower()
+                _is_other_static = any(
+                    current_model.lower() == str(m).lower()
+                    for p, mlist in _PROVIDER_MODELS.items()
+                    if p.lower() != _row_slug
+                    for m in mlist
+                )
+                if not _is_other_static or _row_slug.startswith("custom:"):
+                    _row["models"] = [current_model, *_models]
+                    _row["total_models"] = _row.get("total_models", len(_models)) + 1
             break
 
     # Sort: current provider first, then by model count descending

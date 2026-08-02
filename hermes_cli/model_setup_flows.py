@@ -2010,6 +2010,48 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+def _model_flow_antigravity_acp(config, current_model=""):
+    """Antigravity ACP flow using agy-acp --stdio."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        deactivate_provider,
+        get_external_process_provider_status,
+    )
+    from hermes_cli.config import clear_model_endpoint_credentials, load_config, save_config
+
+    del config
+
+    provider_id = "antigravity-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or "agy-acp-windows-x64.exe"
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Antigravity ACP delegates Hermes turns to `agy-acp --stdio`.")
+    print("  Hermes uses your selected model as a hint for the Antigravity ACP session.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    selected = "antigravity-acp"
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 

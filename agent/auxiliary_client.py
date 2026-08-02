@@ -1759,6 +1759,12 @@ def _maybe_wrap_anthropic(
             return client_obj
     except ImportError:
         pass
+    try:
+        from agent.antigravity_acp_client import AntigravityACPClient
+        if _safe_isinstance(client_obj, AntigravityACPClient):
+            return client_obj
+    except ImportError:
+        pass
 
     # Explicit non-anthropic api_mode wins over URL heuristics.
     if api_mode and api_mode != "anthropic_messages":
@@ -5269,6 +5275,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    try:
+        from agent.antigravity_acp_client import AntigravityACPClient
+        if isinstance(sync_client, AntigravityACPClient):
+            return sync_client, model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -6005,6 +6017,25 @@ def resolve_provider_client(
                 base_url=base_url,
                 command=command,
                 args=args,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        if provider == "antigravity-acp":
+            api_key = str(creds.get("api_key", "")).strip() or "antigravity-acp"
+            base_url = str(creds.get("base_url", "")).strip() or "acp://antigravity"
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            if not final_model:
+                final_model = "gemini-3.6-flash-high"
+            from agent.antigravity_acp_client import AntigravityACPClient
+
+            client = AntigravityACPClient(
+                api_key=api_key,
+                base_url=base_url,
+                command=command,
+                args=args,
+                model=final_model,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
