@@ -4749,6 +4749,16 @@ class AIAgent:
             return primary_client
         if isinstance(primary_client, Mock):
             return primary_client
+        # ACP providers (antigravity, copilot) manage a persistent subprocess
+        # and session on the client object. The per-request client cache below
+        # evicts and rebuilds clients when kwargs don't match — for HTTP
+        # providers that's a cheap httpx pool rebuild, but for ACP it destroys
+        # the subprocess and handshake every turn, causing in=0 out=0 token
+        # counts and total loss of conversation context. Return the shared
+        # primary client directly so the persistent subprocess survives across
+        # turns.
+        if self.provider in {"antigravity-acp", "copilot-acp"}:
+            return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
         # Per-request OpenAI-wire clients (used by both the non-streaming

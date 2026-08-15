@@ -71,6 +71,7 @@ def _build_prompt_blocks(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    acp_cwd: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build ACP-native prompt blocks for the current Hermes turn.
 
@@ -81,7 +82,22 @@ def _build_prompt_blocks(
 
     For vision: image_url content blocks are converted to ACP ``resource``
     blocks so they reach the model instead of being silently dropped.
+
+    Project context (AGENTS.md / CLAUDE.md / .cursorrules) from ``acp_cwd`` is
+    prepended so the ACP model operates with the same project rules that native
+    Hermes injects into its system prompt.
     """
+    # Load project context files from the session's cwd. Native Hermes injects
+    # these into the system prompt; without them the ACP model operates blind.
+    project_context = ""
+    if acp_cwd:
+        try:
+            from agent.prompt_builder import build_context_files_prompt
+
+            project_context = build_context_files_prompt(cwd=acp_cwd).strip()
+        except Exception:
+            pass
+
     # Walk backwards to find the current turn's user-message boundary.
     last_user: dict[str, Any] | None = None
     last_user_index: int | None = None
@@ -93,7 +109,7 @@ def _build_prompt_blocks(
             break
 
     if last_user is None:
-        return [{"type": "text", "text": ""}]
+        return [{"type": "text", "text": project_context}] if project_context else [{"type": "text", "text": ""}]
     assert last_user_index is not None
 
     content = last_user.get("content")
@@ -195,6 +211,13 @@ def _build_prompt_blocks(
         )
         blocks = [block for block in blocks if block.get("type") != "text"]
         blocks.insert(0, {"type": "text", "text": prompt_text})
+
+    # Prepend project context (AGENTS.md / CLAUDE.md / .cursorrules) as a
+    # separate text block so it isn't merged into the tool-schema prompt.
+    if project_context:
+        text_blocks = [b for b in blocks if b.get("type") == "text"]
+        non_text_blocks = [b for b in blocks if b.get("type") != "text"]
+        blocks = [{"type": "text", "text": project_context}, *text_blocks, *non_text_blocks]
 
     return blocks or [{"type": "text", "text": ""}]
 
@@ -314,6 +337,17 @@ class AntigravityACPClient(CopilotACPClient):
             **kwargs,
         )
         self._model_id = model
+        # Persistent session state — avoids respawning the ACP subprocess and
+        # re-handshaking on every turn. The agy-acp server keeps conversation
+        # history within a session, so reusing it gives the model memory across
+        # turns. Respawned only when the process dies or the model changes.
+        self._cached_proc: subprocess.Popen[str] | None = None
+        self._cached_session_id: str | None = None
+        self._cached_model: str | None = None
+        self._cached_inbox: queue.Queue[dict[str, Any]] | None = None
+        self._cached_stderr_tail: deque[str] = deque(maxlen=40)
+        self._cached_next_id: int = 0
+        self._session_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Override _create_chat_completion to extract only the last user
@@ -340,6 +374,7 @@ class AntigravityACPClient(CopilotACPClient):
             model=model or self._model_id,
             tools=tools,
             tool_choice=tool_choice,
+            acp_cwd=self._acp_cwd,
         )
 
         if timeout is None:
@@ -398,80 +433,59 @@ class AntigravityACPClient(CopilotACPClient):
         *,
         timeout_seconds: float,
     ) -> tuple[str, str]:
-        """Send prompt_blocks to agy-acp and return (text, reasoning)."""
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+        """Send prompt_blocks to agy-acp and return (text, reasoning).
 
-            proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
-                creationflags=windows_hide_flags(),
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Antigravity ACP command '{self._acp_command}'."
-            ) from exc
+        Uses a persistent ACP session: the subprocess, handshake, and session
+        ID are cached across calls. The agy-acp server retains conversation
+        history within a session, giving the model memory across turns. The
+        process is respawned only when it dies or the model changes.
+        """
+        with self._session_lock:
+            return self._run_prompt_blocks_locked(prompt_blocks, timeout_seconds=timeout_seconds)
 
-        if proc.stdin is None or proc.stdout is None:
-            proc.kill()
-            raise RuntimeError("Antigravity ACP process did not expose stdin/stdout pipes.")
-        stdin = proc.stdin
+    def _run_prompt_blocks_locked(
+        self,
+        prompt_blocks: list[dict[str, Any]],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, str]:
+        # Clean up any dead cached process before deciding to reuse.
+        if self._cached_proc is not None and self._cached_proc.poll() is not None:
+            self._cleanup_dead_proc()
 
-        self.is_closed = False
-        with self._active_process_lock:
-            self._active_process = proc
+        # Respawn if: no cached session, process died, or model changed.
+        model_changed = self._model_id != self._cached_model
+        if not self._cached_session_id or model_changed:
+            self._spawn_and_handshake(timeout_seconds)
+            assert self._cached_session_id is not None
 
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
-        stderr_tail: deque[str] = deque(maxlen=40)
+        # Send the prompt on the existing (or freshly created) session.
+        inbox = self._cached_inbox
+        assert inbox is not None
+        proc = self._cached_proc
+        assert proc is not None and proc.stdin is not None
 
-        def _stdout_reader() -> None:
-            if proc.stdout is None:
-                return
-            for line in proc.stdout:
-                try:
-                    inbox.put(json.loads(line))
-                except Exception:
-                    inbox.put({"raw": line.rstrip("\n")})
-
-        def _stderr_reader() -> None:
-            if proc.stderr is None:
-                return
-            for line in proc.stderr:
-                stderr_tail.append(line.rstrip("\n"))
-
-        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
-        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
-        out_thread.start()
-        err_thread.start()
-
-        next_id = 0
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
 
         def _request(
             method: str,
             params: dict[str, Any],
             *,
-            text_parts: list[str] | None = None,
-            reasoning_parts: list[str] | None = None,
+            text_parts_arg: list[str] | None = None,
+            reasoning_parts_arg: list[str] | None = None,
         ) -> Any:
-            nonlocal next_id
-            next_id += 1
-            request_id = next_id
+            assert proc.stdin is not None
+            self._cached_next_id += 1
+            request_id = self._cached_next_id
             payload = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": method,
                 "params": params,
             }
-            stdin.write(json.dumps(payload) + "\n")
-            stdin.flush()
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
@@ -486,8 +500,8 @@ class AntigravityACPClient(CopilotACPClient):
                     msg,
                     process=proc,
                     cwd=self._acp_cwd,
-                    text_parts=text_parts,
-                    reasoning_parts=reasoning_parts,
+                    text_parts=text_parts_arg,
+                    reasoning_parts=reasoning_parts_arg,
                 ):
                     continue
 
@@ -500,84 +514,211 @@ class AntigravityACPClient(CopilotACPClient):
                     )
                 return msg.get("result")
 
-            stderr_text = "\n".join(stderr_tail).strip()
+            stderr_text = "\n".join(self._cached_stderr_tail).strip()
             if proc.poll() is not None and stderr_text:
+                self._cleanup_dead_proc()
                 raise RuntimeError(f"Antigravity ACP process exited early: {stderr_text}")
             raise TimeoutError(f"Timed out waiting for Antigravity ACP response to {method}.")
 
-        try:
+        workdir = Path(self._acp_cwd or os.getcwd())
+        with _materialize_prompt_blocks(
+            prompt_blocks, workdir=workdir
+        ) as wire_prompt_blocks:
             _request(
-                "initialize",
+                "session/prompt",
                 {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
-                    "clientInfo": {
-                        "name": "hermes-agent",
-                        "title": "Hermes Agent",
-                        "version": "0.19.0",
-                    },
+                    "sessionId": self._cached_session_id,
+                    "prompt": wire_prompt_blocks,
                 },
+                text_parts_arg=text_parts,
+                reasoning_parts_arg=reasoning_parts,
             )
-            session = _request(
-                "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                    "permissionMode": "bypassPermissions",
-                },
-            ) or {}
-            session_id = str(session.get("sessionId") or "").strip()
-            if not session_id:
-                raise RuntimeError("Antigravity ACP did not return a sessionId.")
+        return "".join(text_parts), "".join(reasoning_parts)
 
-            if self._model_id and any(
-                str(self._model_id).lower().startswith(p)
-                for p in ("gemini-", "claude-", "gpt-")
-            ):
+    def _cleanup_dead_proc(self) -> None:
+        """Tear down references to a dead cached process."""
+        proc = self._cached_proc
+        self._cached_proc = None
+        self._cached_session_id = None
+        self._cached_model = None
+        self._cached_inbox = None
+        self._cached_next_id = 0
+        self._cached_stderr_tail.clear()
+        with self._active_process_lock:
+            self._active_process = None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
                 try:
-                    _request(
-                        "session/set_config_option",
-                        {
-                            "sessionId": session_id,
-                            "configId": "model",
-                            "value": str(self._model_id),
-                        },
-                    )
+                    proc.kill()
                 except Exception:
                     pass
 
+    def _spawn_and_handshake(self, timeout_seconds: float) -> None:
+        """Spawn the ACP subprocess and perform the initial handshake.
+
+        Sets ``_cached_session_id``, ``_cached_proc``, and reader threads.
+        """
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        proc = subprocess.Popen(
+            [self._acp_command] + self._acp_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self._acp_cwd,
+            env=_build_subprocess_env(),
+            creationflags=windows_hide_flags(),
+        )
+        if proc.stdin is None or proc.stdout is None:
+            proc.kill()
+            raise RuntimeError("Antigravity ACP process did not expose stdin/stdout pipes.")
+
+        self.is_closed = False
+        self._cached_proc = proc
+        self._cached_inbox = queue.Queue[dict[str, Any]]()
+        self._cached_stderr_tail.clear()
+        self._cached_next_id = 0
+        with self._active_process_lock:
+            self._active_process = proc
+
+        def _stdout_reader() -> None:
+            if proc.stdout is None or self._cached_inbox is None:
+                return
+            for line in proc.stdout:
+                try:
+                    self._cached_inbox.put(json.loads(line))
+                except Exception:
+                    self._cached_inbox.put({"raw": line.rstrip("\n")})
+
+        def _stderr_reader() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                self._cached_stderr_tail.append(line.rstrip("\n"))
+
+        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
+        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+        out_thread.start()
+        err_thread.start()
+
+        inbox = self._cached_inbox
+        assert inbox is not None and proc.stdin is not None
+
+        def _handshake_request(method: str, params: dict[str, Any]) -> Any:
+            self._cached_next_id += 1
+            request_id = self._cached_next_id
+            payload = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    msg = inbox.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if self._handle_server_message(
+                    msg,
+                    process=proc,
+                    cwd=self._acp_cwd,
+                    text_parts=None,
+                    reasoning_parts=None,
+                ):
+                    continue
+
+                if msg.get("id") != request_id:
+                    continue
+                if "error" in msg:
+                    err = msg.get("error") or {}
+                    self._cleanup_dead_proc()
+                    raise RuntimeError(
+                        f"Antigravity ACP {method} failed: {err.get('message') or err}"
+                    )
+                return msg.get("result")
+
+            stderr_text = "\n".join(self._cached_stderr_tail).strip()
+            if proc.poll() is not None and stderr_text:
+                self._cleanup_dead_proc()
+                raise RuntimeError(f"Antigravity ACP process exited early: {stderr_text}")
+            raise TimeoutError(f"Timed out waiting for Antigravity ACP response to {method}.")
+
+        _handshake_request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": True,
+                        "writeTextFile": True,
+                    }
+                },
+                "clientInfo": {
+                    "name": "hermes-agent",
+                    "title": "Hermes Agent",
+                    "version": "0.19.0",
+                },
+            },
+        )
+        session = _handshake_request(
+            "session/new",
+            {
+                "cwd": self._acp_cwd,
+                "mcpServers": [],
+                "permissionMode": "bypassPermissions",
+            },
+        ) or {}
+        session_id = str(session.get("sessionId") or "").strip()
+        if not session_id:
+            self._cleanup_dead_proc()
+            raise RuntimeError("Antigravity ACP did not return a sessionId.")
+
+        self._cached_session_id = session_id
+        self._cached_model = self._model_id
+
+        if self._model_id and any(
+            str(self._model_id).lower().startswith(p)
+            for p in ("gemini-", "claude-", "gpt-")
+        ):
             try:
-                _request(
+                _handshake_request(
                     "session/set_config_option",
                     {
                         "sessionId": session_id,
-                        "configId": "mode",
-                        "value": "bypassPermissions",
+                        "configId": "model",
+                        "value": str(self._model_id),
                     },
                 )
             except Exception:
                 pass
 
-            text_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            workdir = Path(self._acp_cwd or os.getcwd())
-            with _materialize_prompt_blocks(
-                prompt_blocks, workdir=workdir
-            ) as wire_prompt_blocks:
-                _request(
-                    "session/prompt",
-                    {
-                        "sessionId": session_id,
-                        "prompt": wire_prompt_blocks,
-                    },
-                    text_parts=text_parts,
-                    reasoning_parts=reasoning_parts,
-                )
-            return "".join(text_parts), "".join(reasoning_parts)
-        finally:
-            self.close()
+        try:
+            _handshake_request(
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": "mode",
+                    "value": "bypassPermissions",
+                },
+            )
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Tear down the persistent session and process."""
+        self._cleanup_dead_proc()
+        self.is_closed = True

@@ -33,7 +33,12 @@ from tools.environments.local import hermes_subprocess_env
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+# Accept both <tool_call> (what the prompt instructs) and <autogpt_tool_call>
+# (what some ACP backends emit natively). Capture the full content between the
+# tags — NOT just \{.*?\}, which is non-greedy and breaks on nested JSON objects
+# (e.g. {"function":{"name":"x","arguments":"{}"}} stops at the first inner }),
+# silently dropping the tool call.
+_TOOL_CALL_BLOCK_RE = re.compile(r"<(?:tool_call|autogpt_tool_call)>\s*(.*?)\s*</(?:tool_call|autogpt_tool_call)>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
 # Stderr fingerprint of the deprecated `gh copilot` CLI extension

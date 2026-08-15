@@ -1152,6 +1152,19 @@ def init_agent(
             if agent.provider in {"copilot-acp", "antigravity-acp"}:
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
+                # Inject the session's project cwd so the ACP subprocess operates
+                # in the correct workspace, not the Hermes process home dir.
+                _acp_cwd: str | None = None
+                if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
+                    try:
+                        _row = agent._session_db.get_session(agent.session_id)
+                        if _row and _row.get("cwd"):
+                            _acp_cwd = _row["cwd"]
+                    except Exception:
+                        pass
+                if not _acp_cwd:
+                    _acp_cwd = getattr(agent, "launch_cwd", None) or os.getcwd()
+                client_kwargs["acp_cwd"] = _acp_cwd
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
@@ -1212,6 +1225,20 @@ def init_agent(
                     _routed_headers = getattr(_routed_client, "_default_headers", None)
                 if _routed_headers:
                     client_kwargs["default_headers"] = dict(_routed_headers)
+                # Preserve ACP command/args/cwd from the routed client so
+                # snapshot restores rebuild with the same subprocess config.
+                if agent.provider in {"copilot-acp", "antigravity-acp"}:
+                    client_kwargs["command"] = getattr(_routed_client, "_acp_command", None) or agent.acp_command
+                    client_kwargs["args"] = getattr(_routed_client, "_acp_args", None) or agent.acp_args
+                    _acp_cwd = getattr(_routed_client, "_acp_cwd", None)
+                    if not _acp_cwd and getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
+                        try:
+                            _row = agent._session_db.get_session(agent.session_id)
+                            if _row and _row.get("cwd"):
+                                _acp_cwd = _row["cwd"]
+                        except Exception:
+                            pass
+                    client_kwargs["acp_cwd"] = _acp_cwd or os.getcwd()
             else:
                 # When the user explicitly chose a non-OpenRouter provider
                 # but no credentials were found, fail fast with a clear

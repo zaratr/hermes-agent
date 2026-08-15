@@ -239,6 +239,8 @@ def test_antigravity_acp_client_prompt_flow(mock_popen, _mock_flags, _mock_env):
 
     assert "Gemini" in response.choices[0].message.content
     assert mock_popen.called
+    # Clean up the persistent session
+    client.close()
 
 
 @patch("agent.antigravity_acp_client._build_subprocess_env", return_value={})
@@ -278,3 +280,76 @@ def test_antigravity_acp_client_reasoning_config(mock_popen, _mock_flags, _mock_
     methods_written = [json.loads(call.args[0])["method"] for call in write_calls]
     assert "session/set_config_option" in methods_written
     assert len(write_calls) == 5
+    # Clean up the persistent session
+    client.close()
+
+
+# --- Gap 4: Regex tool-call parsing tests ---
+
+def test_extract_tool_calls_accepts_tool_call_tag():
+    """<tool_call> (what the prompt instructs) must be parsed."""
+    from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+    text = (
+        '<tool_call>{"id":"call_1","type":"function",'
+        '"function":{"name":"read_terminal","arguments":"{}"}}</tool_call>'
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].function.name == "read_terminal"
+
+
+def test_extract_tool_calls_accepts_autogpt_tag():
+    """Backward compat: <autogpt_tool_call> still works."""
+    from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+    text = (
+        '<autogpt_tool_call>{"id":"call_1","type":"function",'
+        '"function":{"name":"search_files","arguments":"{}"}}</autogpt_tool_call>'
+    )
+    calls, _ = _extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].function.name == "search_files"
+
+
+def test_extract_tool_calls_nested_json_not_truncated():
+    """Non-greedy capture must not break on nested JSON in arguments."""
+    from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+    # arguments is itself a JSON string (OpenAI function-call format)
+    inner_args = json.dumps({"path": "/foo", "opts": {"deep": True}})
+    call_obj = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": inner_args},
+    }
+    text = f"<tool_call>{json.dumps(call_obj)}</tool_call>"
+    calls, _ = _extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].function.name == "read_file"
+
+
+# --- Gap 2: Project context injection tests ---
+
+def test_build_prompt_blocks_includes_project_context(tmp_path):
+    """AGENTS.md from acp_cwd must appear in the prompt blocks."""
+    (tmp_path / "AGENTS.md").write_text("Always use Ruff for linting.", encoding="utf-8")
+    blocks = _build_prompt_blocks(
+        [{"role": "user", "content": "hello"}],
+        acp_cwd=str(tmp_path),
+    )
+    prompt_text = " ".join(b.get("text", "") for b in blocks)
+    assert "Ruff" in prompt_text
+    assert "AGENTS.md" in prompt_text
+
+
+def test_build_prompt_blocks_no_context_when_no_file(tmp_path):
+    """No project context block when acp_cwd has no context files."""
+    blocks = _build_prompt_blocks(
+        [{"role": "user", "content": "hello"}],
+        acp_cwd=str(tmp_path),
+    )
+    prompt_text = " ".join(b.get("text", "") for b in blocks)
+    assert "hello" in prompt_text
+    # Should still work normally without project context
+    assert "AGENTS.md" not in prompt_text
